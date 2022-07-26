@@ -2,6 +2,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from einops import rearrange
+from transformers.modeling_utils import PreTrainedModel
+
 from .configuration_vqgan import VQGANConfig
 
 
@@ -375,3 +378,87 @@ class VQGANDecoder(nn.Module):
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states
+
+
+class VectorQuantizer(nn.Module):
+    def __init__(self, config: VQGANConfig):
+        super().__init__()
+        self.config = config
+        self.e_dim = config.embed_dim
+
+        self.embedding = nn.Embedding(self.config.n_embed, self.config.embed_dim)
+        self.embedding.weight.data.uniform_(
+            -1 / self.config.n_embed, 1 / self.config.n_embed
+        )
+
+    def forward(self, z):
+        z = rearrange(z, "b c h w -> b h w c").contiguous()
+        z_flattened = z.view(-1, self.e_dim)
+
+        d = (
+            torch.sum(z_flattened ** 2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight ** 2, dim=1)
+            - 2
+            * torch.einsum(
+                "bd,dn->bn", z_flattened, rearrange(self.embedding.weight, "n d -> d n")
+            )
+        )
+
+        min_encoding_indices = torch.argmin(d, dim=1)
+        z_q = self.embedding(min_encoding_indices).view(z.shape)
+        perplexity = None
+        min_encodings = None
+
+        loss = torch.mean((z_q.detach() - z) ** 2) + 0.5 * torch.mean(
+            (z_q - z.detach()) ** 2
+        )
+
+        z_q = z + (z_q - z).detach()
+
+        z_q = rearrange(z_q, "b h w c -> b c h w").contiguous()
+
+        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+
+    def get_codebook_entry(self, indices, shape):
+        z_q = self.embedding(indices)
+
+        if shape is not None:
+            z_q = z_q.view(shape)
+            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q
+
+
+class VQGANPreTrainedModel(PreTrainedModel):
+    def __init__(self, config: VQGANConfig):
+        super().__init__(config)
+        self.config = config
+
+        self.encoder = VQGANEncoder(config)
+        self.decoder = VQGANDecoder(config)
+        self.quantize = VectorQuantizer(config)
+        self.quant_conv = nn.Conv2d(self.config.z_channels, self.config.embed_dim, 1)
+        self.post_quant_conv = nn.Conv2d(
+            self.config.embed_dim, self.config.z_channels, 1
+        )
+
+    def encode(self, pixel_values):
+        hidden_states = self.encoder(pixel_values)
+        hidden_states = self.quant_conv(hidden_states)
+        quant_states, emb_loss, info = self.quantize(hidden_states)
+        return quant_states, emb_loss, info
+
+    def decode(self, quant_states):
+        hidden_states = self.post_quant_conv(quant_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
+    def decode_code(self, code_b):
+        quant_b = self.quantize.embed_code(code_b)
+        hidden_states = self.decode(quant_b)
+        return hidden_states
+
+    def forward(self, pixel_values):
+        quant_states, emb_loss, _ = self.encode(pixel_values)
+        hidden_states = self.decode(quant_states)
+        return hidden_states, emb_loss
